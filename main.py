@@ -1,285 +1,1240 @@
-import os
+from flask import Flask, request, render_template_string
 import socket
 import struct
 import time
-from flask import Flask, request, render_template_string
+import os
 
 app = Flask(__name__)
 
+# ============================================================
+# CONFIG
+# ============================================================
+
+DEFAULT_TIMEOUT = 3.0
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def read_cstring(data, offset):
+    """Read a null-terminated string."""
+    if offset >= len(data):
+        return "", offset
+
+    end = data.find(b"\x00", offset)
+
+    if end == -1:
+        return data[offset:].decode("utf-8", errors="replace"), len(data)
+
+    return data[offset:end].decode("utf-8", errors="replace"), end + 1
+
+
+def format_time(seconds):
+    """Convert seconds into HH:MM:SS."""
+    try:
+        seconds = int(max(0, seconds))
+    except:
+        return "00:00:00"
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    return "{:02d}:{:02d}:{:02d}".format(hours, minutes, secs)
+
+
+def reverse_dns(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except:
+        return ip
+
+
+# ============================================================
+# UDP RECEIVE
+# ============================================================
+
+def recv_packet(sock):
+    """
+    Receive one UDP packet.
+    Returns:
+        data, source_address, elapsed_time
+    """
+    start = time.time()
+
+    data, addr = sock.recvfrom(65535)
+
+    elapsed = (time.time() - start) * 1000.0
+
+    return data, addr, elapsed
+
+
+# ============================================================
+# A2S INFO
+# ============================================================
+
+def parse_info(data):
+    """
+    Parse A2S_INFO response.
+
+    Normal response:
+        FF FF FF FF 49 ...
+
+    Legacy GoldSrc response:
+        FF FF FF FF 6D ...
+    """
+
+    if len(data) < 6:
+        raise ValueError("A2S_INFO response is too short")
+
+    header = data[:4]
+    response_type = data[4]
+
+    if header != b"\xff\xff\xff\xff":
+        raise ValueError("Invalid A2S_INFO header")
+
+    # --------------------------------------------------------
+    # Modern A2S_INFO response
+    # --------------------------------------------------------
+
+    if response_type == 0x49:
+
+        offset = 5
+
+        protocol = data[offset]
+        offset += 1
+
+        name, offset = read_cstring(data, offset)
+        map_name, offset = read_cstring(data, offset)
+        folder, offset = read_cstring(data, offset)
+        game, offset = read_cstring(data, offset)
+
+        if offset + 2 > len(data):
+            raise ValueError("Incomplete A2S_INFO response")
+
+        app_id = struct.unpack_from("<H", data, offset)[0]
+        offset += 2
+
+        if offset + 4 > len(data):
+            raise ValueError("Incomplete player information")
+
+        players = data[offset]
+        max_players = data[offset + 1]
+        bots = data[offset + 2]
+        server_type = chr(data[offset + 3])
+        environment = chr(data[offset + 4])
+        offset += 5
+
+        visibility = data[offset]
+        offset += 1
+
+        vac = data[offset]
+        offset += 1
+
+        result = {
+            "response_type": "0x49",
+            "protocol": protocol,
+            "name": name,
+            "map": map_name,
+            "folder": folder,
+            "game": game,
+            "app_id": app_id,
+            "players": players,
+            "max_players": max_players,
+            "bots": bots,
+            "server_type": server_type,
+            "environment": environment,
+            "password": bool(visibility),
+            "vac": bool(vac),
+        }
+
+        # EDF
+        if offset < len(data):
+            edf = data[offset]
+            offset += 1
+
+            result["edf"] = "0x{:02X}".format(edf)
+
+            # Port
+            if edf & 0x80:
+                if offset + 2 <= len(data):
+                    result["port"] = struct.unpack_from("<H", data, offset)[0]
+                    offset += 2
+
+            # SteamID
+            if edf & 0x10:
+                if offset + 8 <= len(data):
+                    result["steam_id"] = struct.unpack_from("<Q", data, offset)[0]
+                    offset += 8
+
+            # SourceTV
+            if edf & 0x40:
+                if offset + 2 <= len(data):
+                    tv_port = struct.unpack_from("<H", data, offset)[0]
+                    offset += 2
+
+                    tv_name, offset = read_cstring(data, offset)
+
+                    result["tv_port"] = tv_port
+                    result["tv_name"] = tv_name
+
+            # Keywords
+            if edf & 0x20:
+                keywords, offset = read_cstring(data, offset)
+                result["keywords"] = keywords
+
+            # Game ID
+            if edf & 0x01:
+                if offset + 8 <= len(data):
+                    result["game_id"] = struct.unpack_from("<Q", data, offset)[0]
+
+        return result
+
+    # --------------------------------------------------------
+    # Old GoldSrc A2M_INFO / response 0x6D
+    # --------------------------------------------------------
+
+    elif response_type == 0x6D:
+
+        offset = 5
+
+        address, offset = read_cstring(data, offset)
+        name, offset = read_cstring(data, offset)
+        map_name, offset = read_cstring(data, offset)
+        folder, offset = read_cstring(data, offset)
+        game, offset = read_cstring(data, offset)
+
+        result = {
+            "response_type": "0x6D",
+            "protocol": None,
+            "name": name,
+            "map": map_name,
+            "folder": folder,
+            "game": game,
+            "address": address,
+            "players": None,
+            "max_players": None,
+            "bots": None,
+            "server_type": None,
+            "environment": None,
+            "password": None,
+            "vac": None,
+        }
+
+        if offset < len(data):
+            result["raw_extra"] = data[offset:].hex(" ")
+
+        return result
+
+    else:
+        raise ValueError(
+            "Unknown A2S_INFO response type: 0x{:02X}".format(response_type)
+        )
+
+
+# ============================================================
+# A2S CHALLENGE
+# ============================================================
+
+def get_challenge(sock, target):
+    """
+    Request an A2S challenge.
+
+    Request:
+        FF FF FF FF 57
+
+    Response:
+        FF FF FF FF 41 <4-byte challenge>
+    """
+
+    packet = b"\xff\xff\xff\xff" + b"\x57"
+
+    sock.sendto(packet, target)
+
+    while True:
+        data, addr = sock.recvfrom(65535)
+
+        if len(data) < 9:
+            continue
+
+        # Normal challenge response
+        if data[:4] == b"\xff\xff\xff\xff" and data[4] == 0x41:
+            challenge = data[5:9]
+            return challenge
+
+        # Some servers may directly return A2S_PLAYER response.
+        # In that case there is no challenge to retrieve here.
+        if data[:4] == b"\xff\xff\xff\xff" and data[4] == 0x44:
+            return None
+
+
+# ============================================================
+# SPLIT PACKET REASSEMBLY
+# ============================================================
+
+def receive_a2s_response(sock, first_data=None):
+    """
+    Receive a normal or split A2S response.
+
+    Split packets begin with:
+        FF FF FF FE
+
+    This function reassembles the payload.
+    """
+
+    if first_data is None:
+        first_data, addr = sock.recvfrom(65535)
+
+    # Normal packet
+    if len(first_data) < 4 or first_data[:4] != b"\xff\xff\xff\xfe":
+        return first_data
+
+    packets = {}
+
+    data = first_data
+
+    while True:
+
+        if len(data) < 9:
+            raise ValueError("Invalid split packet")
+
+        # First 4 bytes = -2
+        request_id = struct.unpack_from("<i", data, 4)[0]
+
+        packet_info = data[8]
+
+        packet_number = packet_info & 0x0F
+        total_packets = (packet_info >> 4) & 0x0F
+
+        payload = data[9:]
+
+        packets[packet_number] = payload
+
+        if len(packets) >= total_packets:
+            break
+
+        data, addr = sock.recvfrom(65535)
+
+    combined = b""
+
+    for i in range(total_packets):
+        if i not in packets:
+            raise ValueError("Missing split packet {}".format(i))
+
+        combined += packets[i]
+
+    return combined
+
+
+# ============================================================
+# A2S PLAYER
+# ============================================================
+
+def parse_players(data):
+    """
+    Parse A2S_PLAYER response.
+
+    Response:
+        FF FF FF FF 44
+        player_count
+        index
+        name
+        score
+        duration
+    """
+
+    if len(data) < 6:
+        raise ValueError("A2S_PLAYER response too short")
+
+    if data[:4] != b"\xff\xff\xff\xff":
+        raise ValueError("Invalid A2S_PLAYER header")
+
+    if data[4] != 0x44:
+        raise ValueError(
+            "Unexpected A2S_PLAYER response: 0x{:02X}".format(data[4])
+        )
+
+    offset = 5
+
+    player_count = data[offset]
+    offset += 1
+
+    players = []
+
+    for _ in range(player_count):
+
+        if offset >= len(data):
+            break
+
+        index = data[offset]
+        offset += 1
+
+        name, offset = read_cstring(data, offset)
+
+        if offset + 8 > len(data):
+            break
+
+        score = struct.unpack_from("<i", data, offset)[0]
+        offset += 4
+
+        duration = struct.unpack_from("<f", data, offset)[0]
+        offset += 4
+
+        players.append({
+            "index": index,
+            "name": name,
+            "score": score,
+            "duration": duration,
+            "duration_text": format_time(duration),
+        })
+
+    return players
+
+
+def query_players(sock, target):
+    """
+    Query player names, scores and connected time.
+
+    First tries:
+        FF FF FF FF 55 FF FF FF FF
+
+    If the server gives a challenge:
+        FF FF FF FF 41 <challenge>
+
+    then sends:
+        FF FF FF FF 55 <challenge>
+    """
+
+    # First attempt with challenge -1
+    request = (
+        b"\xff\xff\xff\xff"
+        + b"\x55"
+        + b"\xff\xff\xff\xff"
+    )
+
+    sock.sendto(request, target)
+
+    try:
+        data, addr = sock.recvfrom(65535)
+    except socket.timeout:
+        return [], "Player query timed out"
+
+    # Split response
+    if data[:4] == b"\xff\xff\xff\xfe":
+        try:
+            data = receive_a2s_response(sock, data)
+        except Exception as e:
+            return [], "Player split-packet error: {}".format(e)
+
+    # Direct player response
+    if data[:5] == b"\xff\xff\xff\xff\x44":
+
+        try:
+            return parse_players(data), None
+        except Exception as e:
+            return [], "Player parse error: {}".format(e)
+
+    # Challenge response
+    if data[:5] == b"\xff\xff\xff\xff\x41":
+
+        if len(data) < 9:
+            return [], "Invalid player challenge response"
+
+        challenge = data[5:9]
+
+        request = (
+            b"\xff\xff\xff\xff"
+            + b"\x55"
+            + challenge
+        )
+
+        sock.sendto(request, target)
+
+        try:
+            data, addr = sock.recvfrom(65535)
+        except socket.timeout:
+            return [], "Player challenge response timed out"
+
+        if data[:4] == b"\xff\xff\xff\xfe":
+            try:
+                data = receive_a2s_response(sock, data)
+            except Exception as e:
+                return [], "Player split-packet error: {}".format(e)
+
+        if data[:5] != b"\xff\xff\xff\xff\x44":
+            return [], "Unexpected player response: {}".format(
+                data[4] if len(data) > 4 else -1
+            )
+
+        try:
+            return parse_players(data), None
+        except Exception as e:
+            return [], "Player parse error: {}".format(e)
+
+    return [], "Unexpected A2S_PLAYER response"
+
+
+# ============================================================
+# A2S RULES
+# ============================================================
+
+def parse_rules(data):
+    """
+    Parse A2S_RULES response.
+
+    Response:
+        FF FF FF FF 45
+        uint16 rule_count
+        key\0
+        value\0
+        ...
+    """
+
+    if len(data) < 7:
+        raise ValueError("A2S_RULES response too short")
+
+    if data[:4] != b"\xff\xff\xff\xff":
+        raise ValueError("Invalid A2S_RULES header")
+
+    if data[4] != 0x45:
+        raise ValueError(
+            "Unexpected A2S_RULES response: 0x{:02X}".format(data[4])
+        )
+
+    offset = 5
+
+    rule_count = struct.unpack_from("<H", data, offset)[0]
+    offset += 2
+
+    rules = []
+
+    for _ in range(rule_count):
+
+        key, offset = read_cstring(data, offset)
+
+        value, offset = read_cstring(data, offset)
+
+        rules.append({
+            "key": key,
+            "value": value
+        })
+
+    return rules
+
+
+def query_rules(sock, target):
+    """
+    Query server rules.
+
+    Request:
+        FF FF FF FF 56 <challenge>
+    """
+
+    # Get challenge first
+    challenge_packet = b"\xff\xff\xff\xff" + b"\x57"
+
+    sock.sendto(challenge_packet, target)
+
+    try:
+        data, addr = sock.recvfrom(65535)
+    except socket.timeout:
+        return [], "Rules challenge timed out"
+
+    # Challenge response
+    if (
+        len(data) >= 9
+        and data[:4] == b"\xff\xff\xff\xff"
+        and data[4] == 0x41
+    ):
+
+        challenge = data[5:9]
+
+    else:
+        return [], "Server did not return rules challenge"
+
+    # Send rules request
+    request = (
+        b"\xff\xff\xff\xff"
+        + b"\x56"
+        + challenge
+    )
+
+    sock.sendto(request, target)
+
+    try:
+        data, addr = sock.recvfrom(65535)
+    except socket.timeout:
+        return [], "Rules response timed out"
+
+    # Split packet support
+    if data[:4] == b"\xff\xff\xff\xfe":
+        try:
+            data = receive_a2s_response(sock, data)
+        except Exception as e:
+            return [], "Rules split-packet error: {}".format(e)
+
+    if data[:5] != b"\xff\xff\xff\xff\x45":
+        return [], "Unexpected rules response"
+
+    try:
+        return parse_rules(data), None
+    except Exception as e:
+        return [], "Rules parse error: {}".format(e)
+
+
+# ============================================================
+# MAIN SERVER QUERY
+# ============================================================
+
+def query_server(host, port):
+    start_time = time.time()
+
+    try:
+        port = int(port)
+    except:
+        return {
+            "error": "Invalid port."
+        }
+
+    # --------------------------------------------------------
+    # Resolve hostname
+    # --------------------------------------------------------
+
+    try:
+        ip = socket.gethostbyname(host)
+    except socket.gaierror:
+        return {
+            "error": "Could not resolve hostname: {}".format(host)
+        }
+
+    target = (ip, port)
+
+    # --------------------------------------------------------
+    # Create UDP socket
+    # --------------------------------------------------------
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(DEFAULT_TIMEOUT)
+
+    info_data = None
+    info_ping = None
+
+    try:
+
+        # ----------------------------------------------------
+        # A2S_INFO
+        # ----------------------------------------------------
+
+        info_request = (
+            b"\xff\xff\xff\xff"
+            + b"\x54"
+            + b"Source Engine Query\x00"
+        )
+
+        info_start = time.time()
+
+        sock.sendto(info_request, target)
+
+        info_data, addr = sock.recvfrom(65535)
+
+        info_ping = (time.time() - info_start) * 1000.0
+
+        # ----------------------------------------------------
+        # Handle split A2S_INFO
+        # ----------------------------------------------------
+
+        if info_data[:4] == b"\xff\xff\xff\xfe":
+            info_data = receive_a2s_response(sock, info_data)
+
+        info = parse_info(info_data)
+
+        # ----------------------------------------------------
+        # A2S_PLAYER
+        # ----------------------------------------------------
+
+        players, player_error = query_players(sock, target)
+
+        # ----------------------------------------------------
+        # A2S_RULES
+        # ----------------------------------------------------
+
+        rules, rules_error = query_rules(sock, target)
+
+        total_time = (time.time() - start_time) * 1000.0
+
+        return {
+            "target": "{}:{}".format(host, port),
+            "ip": ip,
+            "hostname": reverse_dns(ip),
+
+            "ping": info_ping,
+            "total_time": total_time,
+
+            "bytes": len(info_data),
+            "raw": info_data.hex(" "),
+
+            "info": info,
+
+            "players_list": players,
+            "player_error": player_error,
+
+            "rules": rules,
+            "rules_error": rules_error,
+
+            "queried_at": time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        }
+
+    except socket.timeout:
+
+        return {
+            "error": "Connection timed out. Server did not answer UDP queries.",
+            "target": "{}:{}".format(host, port),
+            "ip": ip
+        }
+
+    except Exception as e:
+
+        return {
+            "error": str(e),
+            "target": "{}:{}".format(host, port),
+            "ip": ip
+        }
+
+    finally:
+        sock.close()
+
+
+# ============================================================
+# HTML PAGE
+# ============================================================
 
 HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>WON2 / GoldSrc Server Checker</title>
 
-    <style>
-        body {
-            background: #111;
-            color: #eee;
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 20px;
-        }
+<meta charset="UTF-8">
 
-        .box {
-            max-width: 700px;
-            margin: auto;
-            background: #1d1d1d;
-            padding: 20px;
-            border-radius: 12px;
-        }
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
 
-        h1 {
-            font-size: 24px;
-        }
+<title>GoldSrc Server Query</title>
 
-        input {
-            width: 100%;
-            box-sizing: border-box;
-            padding: 12px;
-            margin: 6px 0 12px;
-            background: #292929;
-            border: 1px solid #555;
-            color: white;
-            border-radius: 6px;
-        }
+<style>
 
-        button {
-            width: 100%;
-            padding: 13px;
-            background: #444;
-            color: white;
-            border: 0;
-            border-radius: 6px;
-            font-size: 16px;
-        }
+body {
+    font-family: Arial, sans-serif;
+    background: #111;
+    color: #eee;
+    margin: 0;
+    padding: 20px;
+}
 
-        button:hover {
-            background: #666;
-        }
+.container {
+    max-width: 1100px;
+    margin: auto;
+}
 
-        .result {
-            margin-top: 20px;
-            background: #101010;
-            padding: 15px;
-            border-radius: 8px;
-        }
+h1 {
+    margin-bottom: 20px;
+}
 
-        .ok {
-            color: #5cff75;
-        }
+h2 {
+    margin-top: 30px;
+}
 
-        .bad {
-            color: #ff5555;
-        }
+form {
+    background: #1c1c1c;
+    padding: 18px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+}
 
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
+input {
+    background: #111;
+    color: white;
+    border: 1px solid #555;
+    padding: 10px;
+    border-radius: 5px;
+    margin-right: 8px;
+}
 
-        td {
-            padding: 7px;
-            border-bottom: 1px solid #333;
-        }
+button {
+    padding: 10px 18px;
+    border: 0;
+    border-radius: 5px;
+    cursor: pointer;
+}
 
-        td:first-child {
-            font-weight: bold;
-            width: 40%;
-        }
+.card {
+    background: #1c1c1c;
+    padding: 18px;
+    border-radius: 8px;
+    margin-bottom: 18px;
+    overflow-x: auto;
+}
 
-        pre {
-            white-space: pre-wrap;
-            word-break: break-all;
-            font-size: 11px;
-            color: #aaa;
-        }
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
 
-        .small {
-            color: #999;
-            font-size: 13px;
-        }
-    </style>
+th, td {
+    border-bottom: 1px solid #444;
+    padding: 9px;
+    text-align: left;
+}
+
+th {
+    background: #252525;
+}
+
+tr:hover {
+    background: #222;
+}
+
+.label {
+    font-weight: bold;
+    width: 200px;
+}
+
+.good {
+    color: #6cff6c;
+}
+
+.bad {
+    color: #ff6868;
+}
+
+.warning {
+    color: #ffd866;
+}
+
+pre {
+    background: #080808;
+    padding: 12px;
+    border-radius: 5px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.small {
+    color: #aaa;
+    font-size: 13px;
+}
+
+.player-name {
+    font-weight: bold;
+}
+
+</style>
+
 </head>
 
 <body>
 
-<div class="box">
+<div class="container">
 
-<h1>WON2 / GoldSrc Server Checker</h1>
+<h1>GoldSrc / A2S Server Query</h1>
 
 <form method="POST">
 
-    <label>IP address / hostname</label>
-
     <input
-        name="ip"
-        value="{{ ip }}"
-        placeholder="185.107.96.202"
+        type="text"
+        name="host"
+        placeholder="IP or hostname"
+        value="{{ host }}"
         required
     >
 
-    <label>Port</label>
-
     <input
-        name="port"
-        value="{{ port }}"
-        placeholder="27015"
         type="number"
+        name="port"
+        placeholder="Port"
+        value="{{ port }}"
         min="1"
         max="65535"
         required
     >
 
-    <button type="submit">CHECK SERVER</button>
+    <button type="submit">
+        Query Server
+    </button>
 
 </form>
 
-{% if result %}
 
-<div class="result">
+{% if result %}
 
     {% if result.error %}
 
-        <h2 class="bad">✗ {{ result.error }}</h2>
+        <div class="card">
+
+            <h2 class="bad">Server Offline / Query Failed</h2>
+
+            <p>{{ result.error }}</p>
+
+            {% if result.target %}
+                <p><b>Target:</b> {{ result.target }}</p>
+            {% endif %}
+
+        </div>
 
     {% else %}
 
-        {% if result.response %}
+        <!-- =================================================
+             SERVER STATUS
+        ================================================== -->
 
-            <h2 class="ok">✓ SERVER ANSWERED</h2>
+        <div class="card">
 
-        {% else %}
+            <h2>
+                {{ result.info.name }}
+            </h2>
 
-            <h2 class="bad">✗ NO UDP RESPONSE</h2>
+            <p class="good">
+                ● Server responded
+            </p>
 
-        {% endif %}
+            <table>
 
-        <table>
+                <tr>
+                    <td class="label">Target</td>
+                    <td>{{ result.target }}</td>
+                </tr>
 
-            <tr>
-                <td>Target</td>
-                <td>{{ result.target }}</td>
-            </tr>
+                <tr>
+                    <td class="label">IP Address</td>
+                    <td>{{ result.ip }}</td>
+                </tr>
 
-            <tr>
-                <td>Hostname</td>
-                <td>{{ result.hostname }}</td>
-            </tr>
+                <tr>
+                    <td class="label">Hostname</td>
+                    <td>{{ result.hostname }}</td>
+                </tr>
 
-            <tr>
-                <td>Ping</td>
-                <td>{{ result.ping }}</td>
-            </tr>
+                <tr>
+                    <td class="label">Ping</td>
+                    <td>{{ "%.2f"|format(result.ping) }} ms</td>
+                </tr>
 
-            <tr>
-                <td>Bytes received</td>
-                <td>{{ result.bytes }}</td>
-            </tr>
+                <tr>
+                    <td class="label">Bytes Received</td>
+                    <td>{{ result.bytes }}</td>
+                </tr>
 
-            <tr>
-                <td>Response type</td>
-                <td>{{ result.response_type }}</td>
-            </tr>
+                <tr>
+                    <td class="label">Total Query Time</td>
+                    <td>{{ "%.2f"|format(result.total_time) }} ms</td>
+                </tr>
 
-            {% if result.name %}
-            <tr>
-                <td>Server name</td>
-                <td>{{ result.name }}</td>
-            </tr>
+                <tr>
+                    <td class="label">Response Type</td>
+                    <td>{{ result.info.response_type }}</td>
+                </tr>
+
+                <tr>
+                    <td class="label">Protocol</td>
+                    <td>
+                        {% if result.info.protocol is not none %}
+                            {{ result.info.protocol }}
+                        {% else %}
+                            N/A
+                        {% endif %}
+                    </td>
+                </tr>
+
+            </table>
+
+        </div>
+
+
+        <!-- =================================================
+             SERVER INFO
+        ================================================== -->
+
+        <div class="card">
+
+            <h2>Server Info</h2>
+
+            <table>
+
+                <tr>
+                    <td class="label">Server Name</td>
+                    <td>{{ result.info.name }}</td>
+                </tr>
+
+                <tr>
+                    <td class="label">Map</td>
+                    <td>{{ result.info.map }}</td>
+                </tr>
+
+                <tr>
+                    <td class="label">Game / Mod</td>
+                    <td>{{ result.info.game }}</td>
+                </tr>
+
+                <tr>
+                    <td class="label">Game Folder</td>
+                    <td>{{ result.info.folder }}</td>
+                </tr>
+
+                <tr>
+                    <td class="label">Players</td>
+                    <td>
+                        {{ result.info.players }}
+                        /
+                        {{ result.info.max_players }}
+                    </td>
+                </tr>
+
+                <tr>
+                    <td class="label">Bots</td>
+                    <td>{{ result.info.bots }}</td>
+                </tr>
+
+                <tr>
+                    <td class="label">Server Type</td>
+                    <td>
+                        {% if result.info.server_type %}
+                            {{ result.info.server_type }}
+                        {% else %}
+                            N/A
+                        {% endif %}
+                    </td>
+                </tr>
+
+                <tr>
+                    <td class="label">Operating System</td>
+                    <td>
+                        {% if result.info.environment == "l" %}
+                            Linux
+                        {% elif result.info.environment == "w" %}
+                            Windows
+                        {% elif result.info.environment == "m" %}
+                            Mac
+                        {% else %}
+                            {{ result.info.environment }}
+                        {% endif %}
+                    </td>
+                </tr>
+
+                <tr>
+                    <td class="label">Password Protected</td>
+                    <td>
+                        {% if result.info.password %}
+                            Yes
+                        {% else %}
+                            No
+                        {% endif %}
+                    </td>
+                </tr>
+
+                <tr>
+                    <td class="label">VAC</td>
+                    <td>
+                        {% if result.info.vac %}
+                            Enabled
+                        {% else %}
+                            Disabled
+                        {% endif %}
+                    </td>
+                </tr>
+
+                {% if result.info.app_id %}
+                <tr>
+                    <td class="label">App ID</td>
+                    <td>{{ result.info.app_id }}</td>
+                </tr>
+                {% endif %}
+
+                {% if result.info.keywords %}
+                <tr>
+                    <td class="label">Keywords</td>
+                    <td>{{ result.info.keywords }}</td>
+                </tr>
+                {% endif %}
+
+                {% if result.info.tv_port %}
+                <tr>
+                    <td class="label">SourceTV Port</td>
+                    <td>{{ result.info.tv_port }}</td>
+                </tr>
+                {% endif %}
+
+                {% if result.info.tv_name %}
+                <tr>
+                    <td class="label">SourceTV Name</td>
+                    <td>{{ result.info.tv_name }}</td>
+                </tr>
+                {% endif %}
+
+            </table>
+
+        </div>
+
+
+        <!-- =================================================
+             PLAYERS
+        ================================================== -->
+
+        <div class="card">
+
+            <h2>
+                Players
+                ({{ result.players_list|length }})
+            </h2>
+
+            {% if result.players_list %}
+
+                <table>
+
+                    <tr>
+                        <th>#</th>
+                        <th>Player Name</th>
+                        <th>Score</th>
+                        <th>Connected Time</th>
+                    </tr>
+
+                    {% for player in result.players_list %}
+
+                    <tr>
+
+                        <td>
+                            {{ player.index }}
+                        </td>
+
+                        <td class="player-name">
+                            {{ player.name }}
+                        </td>
+
+                        <td>
+                            {{ player.score }}
+                        </td>
+
+                        <td>
+                            {{ player.duration_text }}
+                        </td>
+
+                    </tr>
+
+                    {% endfor %}
+
+                </table>
+
+            {% else %}
+
+                {% if result.player_error %}
+
+                    <p class="warning">
+                        {{ result.player_error }}
+                    </p>
+
+                {% else %}
+
+                    <p>
+                        No players connected.
+                    </p>
+
+                {% endif %}
+
             {% endif %}
 
-            {% if result.map %}
-            <tr>
-                <td>Map</td>
-                <td>{{ result.map }}</td>
-            </tr>
+        </div>
+
+
+        <!-- =================================================
+             RULES
+        ================================================== -->
+
+        <div class="card">
+
+            <h2>
+                Server Rules
+                ({{ result.rules|length }})
+            </h2>
+
+            {% if result.rules %}
+
+                <table>
+
+                    <tr>
+                        <th>Rule</th>
+                        <th>Value</th>
+                    </tr>
+
+                    {% for rule in result.rules %}
+
+                    <tr>
+
+                        <td>
+                            {{ rule.key }}
+                        </td>
+
+                        <td>
+                            {{ rule.value }}
+                        </td>
+
+                    </tr>
+
+                    {% endfor %}
+
+                </table>
+
+            {% else %}
+
+                {% if result.rules_error %}
+
+                    <p class="warning">
+                        {{ result.rules_error }}
+                    </p>
+
+                {% else %}
+
+                    <p>
+                        No rules returned.
+                    </p>
+
+                {% endif %}
+
             {% endif %}
 
-            {% if result.folder %}
-            <tr>
-                <td>Folder</td>
-                <td>{{ result.folder }}</td>
-            </tr>
-            {% endif %}
+        </div>
 
-            {% if result.game %}
-            <tr>
-                <td>Game</td>
-                <td>{{ result.game }}</td>
-            </tr>
-            {% endif %}
 
-            {% if result.protocol %}
-            <tr>
-                <td>Protocol</td>
-                <td>{{ result.protocol }}</td>
-            </tr>
-            {% endif %}
+        <!-- =================================================
+             RAW PACKET
+        ================================================== -->
 
-            {% if result.players is not none %}
-            <tr>
-                <td>Players</td>
-                <td>{{ result.players }} / {{ result.max_players }}</td>
-            </tr>
-            {% endif %}
+        <div class="card">
 
-            {% if result.bots is not none %}
-            <tr>
-                <td>Bots</td>
-                <td>{{ result.bots }}</td>
-            </tr>
-            {% endif %}
+            <h2>Raw A2S_INFO Packet</h2>
 
-            {% if result.server_type %}
-            <tr>
-                <td>Server type</td>
-                <td>{{ result.server_type }}</td>
-            </tr>
-            {% endif %}
+            <pre>{{ result.raw }}</pre>
 
-            {% if result.os %}
-            <tr>
-                <td>OS</td>
-                <td>{{ result.os }}</td>
-            </tr>
-            {% endif %}
+        </div>
 
-            {% if result.password is not none %}
-            <tr>
-                <td>Password</td>
-                <td>{{ result.password }}</td>
-            </tr>
-            {% endif %}
 
-            {% if result.vac is not none %}
-            <tr>
-                <td>VAC</td>
-                <td>{{ result.vac }}</td>
-            </tr>
-            {% endif %}
+        <!-- =================================================
+             QUERY TIME
+        ================================================== -->
 
-        </table>
+        <div class="card">
 
-        {% if result.message %}
-            <p>{{ result.message }}</p>
-        {% endif %}
+            <p class="small">
+                Queried at: {{ result.queried_at }}
+            </p>
 
-        <h3>Raw packet</h3>
-
-        <pre>{{ result.hex }}</pre>
+        </div>
 
     {% endif %}
 
-</div>
-
 {% endif %}
-
-<p class="small">
-    Queries are sent using UDP A2S/legacy GoldSrc protocol.
-</p>
 
 </div>
 
@@ -288,333 +1243,53 @@ HTML = r"""
 """
 
 
-def read_cstring(data, pos):
-    end = data.find(b"\x00", pos)
-
-    if end == -1:
-        raise ValueError("Missing string terminator")
-
-    value = data[pos:end].decode("utf-8", errors="replace")
-
-    return value, end + 1
-
-
-def reverse_dns(ip):
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except:
-        return "No reverse DNS"
-
-
-def query_server(ip, port):
-
-    result = {
-        "target": "%s:%d" % (ip, port),
-        "hostname": reverse_dns(ip),
-        "response": False,
-        "ping": "-",
-        "bytes": 0,
-        "response_type": "-",
-        "name": None,
-        "map": None,
-        "folder": None,
-        "game": None,
-        "protocol": None,
-        "players": None,
-        "max_players": None,
-        "bots": None,
-        "server_type": None,
-        "os": None,
-        "password": None,
-        "vac": None,
-        "message": "",
-        "hex": ""
-    }
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(5)
-
-    # A2S_INFO
-    packet = (
-        b"\xff\xff\xff\xff"
-        b"\x54"
-        b"Source Engine Query\x00"
-    )
-
-    try:
-
-        start = time.time()
-
-        sock.sendto(packet, (ip, port))
-
-        data, address = sock.recvfrom(65535)
-
-        elapsed = (time.time() - start) * 1000
-
-        result["response"] = True
-        result["ping"] = "%.1f ms" % elapsed
-        result["bytes"] = len(data)
-        result["hex"] = data.hex(" ")
-
-        if len(data) < 5:
-            result["message"] = "Response was too short."
-            return result
-
-        response_type = data[4]
-
-        result["response_type"] = "0x%02X" % response_type
-
-        # ==================================================
-        # LEGACY GOLDSRC
-        # ==================================================
-
-        if response_type == 0x6D:
-
-            result["message"] = "Legacy GoldSrc response detected."
-
-            pos = 5
-
-            try:
-
-                address_text, pos = read_cstring(data, pos)
-                name, pos = read_cstring(data, pos)
-                map_name, pos = read_cstring(data, pos)
-                folder, pos = read_cstring(data, pos)
-                game, pos = read_cstring(data, pos)
-
-                result["name"] = name
-                result["map"] = map_name
-                result["folder"] = folder
-                result["game"] = game
-
-                if pos + 7 <= len(data):
-
-                    result["players"] = data[pos]
-                    result["max_players"] = data[pos + 1]
-                    result["protocol"] = data[pos + 2]
-
-                    result["server_type"] = chr(data[pos + 3])
-                    result["os"] = chr(data[pos + 4])
-
-                    result["password"] = bool(data[pos + 5])
-
-                return result
-
-            except Exception as e:
-
-                result["message"] = (
-                    "Legacy response detected but parsing failed: "
-                    + repr(e)
-                )
-
-                return result
-
-        # ==================================================
-        # NORMAL A2S INFO
-        # ==================================================
-
-        if response_type == 0x49:
-
-            result["message"] = "Standard A2S_INFO response detected."
-
-            pos = 5
-
-            try:
-
-                result["protocol"] = data[pos]
-                pos += 1
-
-                result["name"], pos = read_cstring(data, pos)
-                result["map"], pos = read_cstring(data, pos)
-                result["folder"], pos = read_cstring(data, pos)
-                result["game"], pos = read_cstring(data, pos)
-
-                # App ID
-                if pos + 2 <= len(data):
-
-                    pos += 2
-
-                if pos < len(data):
-
-                    result["players"] = data[pos]
-                    pos += 1
-
-                if pos < len(data):
-
-                    result["max_players"] = data[pos]
-                    pos += 1
-
-                # Number of bots
-                if pos < len(data):
-
-                    result["bots"] = data[pos]
-                    pos += 1
-
-                # Server type
-                if pos < len(data):
-
-                    result["server_type"] = chr(data[pos])
-                    pos += 1
-
-                # OS
-                if pos < len(data):
-
-                    result["os"] = chr(data[pos])
-                    pos += 1
-
-                # Password
-                if pos < len(data):
-
-                    result["password"] = bool(data[pos])
-                    pos += 1
-
-                # VAC
-                #
-                # This location can vary depending on whether
-                # the server reports an EDF field.
-                #
-                if pos < len(data):
-
-                    # skip EDF if present in a safe way
-                    result["vac"] = None
-
-                return result
-
-            except Exception as e:
-
-                result["message"] = (
-                    "A2S response detected but parsing failed: "
-                    + repr(e)
-                )
-
-                return result
-
-        # ==================================================
-        # UNKNOWN
-        # ==================================================
-
-        result["message"] = (
-            "Server answered, but the response is not a normal "
-            "A2S_INFO or legacy 0x6D response."
-        )
-
-        return result
-
-    except socket.timeout:
-
-        result["message"] = (
-            "No UDP response after 5 seconds. "
-            "The port may be closed, filtered, wrong, "
-            "or the server may use another protocol."
-        )
-
-        return result
-
-    except Exception as e:
-
-        result["error"] = repr(e)
-
-        return result
-
-    finally:
-
-        sock.close()
-
+# ============================================================
+# FLASK ROUTE
+# ============================================================
 
 @app.route("/", methods=["GET", "POST"])
 def index():
 
-    ip = ""
-    port = "27015"
     result = None
+
+    host = ""
+    port = "27015"
 
     if request.method == "POST":
 
-        ip = request.form.get("ip", "").strip()
-        port_text = request.form.get("port", "").strip()
+        host = request.form.get("host", "").strip()
+        port = request.form.get("port", "27015").strip()
 
-        try:
-            port = int(port_text)
-        except:
-            result = {
-                "error": "Invalid port."
-            }
+        if host:
 
-            return render_template_string(
-                HTML,
-                ip=ip,
-                port=port,
-                result=result
-            )
-
-        # Basic validation
-
-        if not ip:
-
-            result = {
-                "error": "Enter an IP address or hostname."
-            }
-
-            return render_template_string(
-                HTML,
-                ip=ip,
-                port=port,
-                result=result
-            )
-
-        if port < 1 or port > 65535:
-
-            result = {
-                "error": "Port must be between 1 and 65535."
-            }
-
-            return render_template_string(
-                HTML,
-                ip=ip,
-                port=port,
-                result=result
-            )
-
-        # Resolve hostname/IP
-
-        try:
-
-            resolved_ip = socket.gethostbyname(ip)
-
-        except Exception:
-
-            result = {
-                "error": "Could not resolve that IP/hostname."
-            }
-
-            return render_template_string(
-                HTML,
-                ip=ip,
-                port=port,
-                result=result
-            )
-
-        result = query_server(resolved_ip, port)
+            result = query_server(host, port)
 
     return render_template_string(
         HTML,
-        ip=ip,
-        port=port,
-        result=result
+        result=result,
+        host=host,
+        port=port
     )
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.route("/health")
 def health():
+    return "OK"
 
-    return "OK", 200
 
+# ============================================================
+# LOCAL RUN
+# ============================================================
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT", 10000))
 
     app.run(
         host="0.0.0.0",
         port=port
-                )
+)
