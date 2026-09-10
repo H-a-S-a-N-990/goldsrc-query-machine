@@ -2,45 +2,37 @@ from flask import Flask, request, render_template_string
 import socket
 import struct
 import time
+import os
 
 app = Flask(__name__)
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-DEFAULT_TIMEOUT = 3.0
+TIMEOUT = 5.0
 
 
 # ============================================================
-# BASIC UDP
+# SOCKET / PACKET
 # ============================================================
 
 def make_socket():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(DEFAULT_TIMEOUT)
-    return sock
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(TIMEOUT)
+    return s
 
 
-def send_recv(sock, target, packet, timeout=DEFAULT_TIMEOUT):
-    sock.settimeout(timeout)
-
+def send_packet(sock, target, packet):
     start = time.time()
 
-    try:
-        sock.sendto(packet, target)
-        data, addr = sock.recvfrom(65535)
+    sock.sendto(packet, target)
 
-        ping = (time.time() - start) * 1000.0
+    data, addr = sock.recvfrom(65535)
 
-        return data, ping, addr
+    ping = (time.time() - start) * 1000.0
 
-    except Exception as e:
-        return None, None, str(e)
+    return data, ping
 
 
 # ============================================================
-# STRING HELPERS
+# BASIC READERS
 # ============================================================
 
 def read_cstring(data, pos):
@@ -50,158 +42,159 @@ def read_cstring(data, pos):
     end = data.find(b"\x00", pos)
 
     if end == -1:
-        return data[pos:].decode("utf-8", errors="replace"), len(data)
+        return data[pos:].decode("utf-8", "replace"), len(data)
 
-    return data[pos:end].decode("utf-8", errors="replace"), end + 1
+    return data[pos:end].decode("utf-8", "replace"), end + 1
 
 
-def safe_u8(data, pos):
-    if pos >= len(data):
-        return 0, pos + 1
+def read_u8(data, pos):
+    if pos + 1 > len(data):
+        raise ValueError("Packet ended while reading u8")
 
     return data[pos], pos + 1
 
 
-def safe_i32(data, pos):
-    if pos + 4 > len(data):
-        return 0, pos + 4
-
-    return struct.unpack_from("<i", data, pos)[0], pos + 4
-
-
-def safe_u16(data, pos):
+def read_u16(data, pos):
     if pos + 2 > len(data):
-        return 0, pos + 2
+        raise ValueError("Packet ended while reading u16")
 
     return struct.unpack_from("<H", data, pos)[0], pos + 2
 
 
-def safe_u32(data, pos):
+def read_u32(data, pos):
     if pos + 4 > len(data):
-        return 0, pos + 4
+        raise ValueError("Packet ended while reading u32")
 
     return struct.unpack_from("<I", data, pos)[0], pos + 4
 
 
-def safe_float(data, pos):
+def read_i32(data, pos):
     if pos + 4 > len(data):
-        return 0.0, pos + 4
+        raise ValueError("Packet ended while reading i32")
+
+    return struct.unpack_from("<i", data, pos)[0], pos + 4
+
+
+def read_float(data, pos):
+    if pos + 4 > len(data):
+        raise ValueError("Packet ended while reading float")
 
     return struct.unpack_from("<f", data, pos)[0], pos + 4
 
 
 # ============================================================
-# SPLIT PACKET REASSEMBLY
+# GOLDsrc SPLIT PACKETS
+#
+# GoldSrc split header:
+#
+# FF FF FF FE
+# 4 byte packet ID
+# 1 byte:
+#     upper bits = fragment index
+#     lower 4 bits = total fragments
+#
+# The payload begins at byte 9.
 # ============================================================
 
-def receive_response(sock, first_packet, target):
-    """
-    Handles normal GoldSrc/A2S packets.
+def is_split(data):
+    return len(data) >= 4 and data[:4] == b"\xff\xff\xff\xfe"
 
-    Also attempts to reassemble common split packets.
-    """
 
-    if not first_packet:
+def split_header(data):
+    if len(data) < 9:
         return None
 
-    # Normal packet
-    if first_packet[:4] == b"\xff\xff\xff\xff":
-        return first_packet
+    packet_id = data[4:8]
+    info = data[8]
 
-    # Common split packet header:
-    #
-    # FF FF FF FE
-    # packet ID
-    # total / number
-    #
-    if first_packet[:4] != b"\xff\xff\xff\xfe":
-        return first_packet
+    index = info >> 4
+    total = info & 0x0F
 
-    packets = [first_packet]
+    return packet_id, index, total
 
-    try:
-        header = first_packet
 
-        if len(header) < 9:
-            return first_packet
+def receive_complete(sock, first):
 
-        packet_id = header[4:8]
-        packet_info = header[8]
+    # Normal GoldSrc/A2S packet
+    if not is_split(first):
+        return first
 
-        total = packet_info & 0x0F
+    h = split_header(first)
 
-        if total <= 1:
-            return first_packet[9:]
+    if h is None:
+        return first
 
-        pieces = {}
+    packet_id, index, total = h
 
-        # First packet
-        index = (packet_info >> 4) & 0x0F
-        pieces[index] = first_packet[9:]
+    if total <= 1:
+        return first[9:]
 
-        sock.settimeout(DEFAULT_TIMEOUT)
+    pieces = {}
 
-        while len(pieces) < total:
+    pieces[index] = first[9:]
 
-            data, addr = sock.recvfrom(65535)
+    deadline = time.time() + TIMEOUT
 
-            if data[:4] != b"\xff\xff\xff\xfe":
-                continue
+    while len(pieces) < total:
 
-            if len(data) < 9:
-                continue
+        remaining = deadline - time.time()
 
-            if data[4:8] != packet_id:
-                continue
+        if remaining <= 0:
+            raise socket.timeout(
+                "Timed out waiting for GoldSrc split packets"
+            )
 
-            info = data[8]
+        sock.settimeout(remaining)
 
-            idx = (info >> 4) & 0x0F
+        packet, addr = sock.recvfrom(65535)
 
-            pieces[idx] = data[9:]
+        if not is_split(packet):
+            continue
 
-        result = b""
+        h2 = split_header(packet)
 
-        for i in range(total):
-            result += pieces.get(i, b"")
+        if h2 is None:
+            continue
 
-        return result
+        packet_id2, index2, total2 = h2
 
-    except Exception:
-        return first_packet
+        if packet_id2 != packet_id:
+            continue
+
+        if total2 != total:
+            continue
+
+        pieces[index2] = packet[9:]
+
+    result = b""
+
+    for i in range(total):
+        if i not in pieces:
+            raise ValueError(
+                "Missing split packet %d/%d" %
+                (i, total)
+            )
+
+        result += pieces[i]
+
+    return result
 
 
 # ============================================================
-# LEGACY GOLD-SRC INFO
+# INFO
 # ============================================================
 
 def parse_legacy_info(data):
 
-    result = {
-        "response_type": "0x6D",
-        "address": "",
-        "name": "",
-        "map": "",
-        "folder": "",
-        "game": "",
-        "players": 0,
-        "maxplayers": 0,
-        "protocol": 0,
-        "type": "",
-        "os": "",
-        "password": False,
-        "mod": False,
-        "vac": False,
-        "bots": 0
-    }
-
     if len(data) < 6:
-        return result
+        raise ValueError("Legacy info packet too short")
 
     if data[:5] != b"\xff\xff\xff\xff\x6d":
-        return result
+        raise ValueError("Not a GoldSrc 0x6D response")
 
     pos = 5
+
+    result = {}
 
     result["address"], pos = read_cstring(data, pos)
     result["name"], pos = read_cstring(data, pos)
@@ -209,208 +202,207 @@ def parse_legacy_info(data):
     result["folder"], pos = read_cstring(data, pos)
     result["game"], pos = read_cstring(data, pos)
 
-    result["players"], pos = safe_u8(data, pos)
-    result["maxplayers"], pos = safe_u8(data, pos)
-    result["protocol"], pos = safe_u8(data, pos)
+    result["players"], pos = read_u8(data, pos)
+    result["maxplayers"], pos = read_u8(data, pos)
+    result["protocol"], pos = read_u8(data, pos)
 
-    if pos < len(data):
-        result["type"] = chr(data[pos])
-        pos += 1
+    result["type"] = chr(data[pos])
+    pos += 1
 
-    if pos < len(data):
-        result["os"] = chr(data[pos])
-        pos += 1
+    result["os"] = chr(data[pos])
+    pos += 1
 
-    password, pos = safe_u8(data, pos)
+    password, pos = read_u8(data, pos)
     result["password"] = bool(password)
 
-    modded, pos = safe_u8(data, pos)
-    result["mod"] = bool(modded)
+    mod, pos = read_u8(data, pos)
+    result["mod"] = bool(mod)
 
-    # If modded, additional fields exist
-    if modded:
+    if mod:
 
-        # Website
-        _, pos = read_cstring(data, pos)
+        result["mod_website"], pos = read_cstring(data, pos)
+        result["mod_download"], pos = read_cstring(data, pos)
 
-        # Download URL
-        _, pos = read_cstring(data, pos)
-
-        # Mod null terminator
         if pos < len(data):
             pos += 1
 
-        # Mod version
-        _, pos = safe_u32(data, pos)
+        result["mod_version"], pos = read_u32(data, pos)
+        result["mod_size"], pos = read_u32(data, pos)
 
-        # Mod size
-        _, pos = safe_u32(data, pos)
+        result["mod_type"], pos = read_u8(data, pos)
+        result["mod_dll"], pos = read_u8(data, pos)
 
-        # Mod type
-        _, pos = safe_u8(data, pos)
-
-        # DLL
-        _, pos = safe_u8(data, pos)
-
-    # VAC / secure
+    # Secure / VAC
     if pos < len(data):
-        vac, pos = safe_u8(data, pos)
-        result["vac"] = bool(vac)
+        secure, pos = read_u8(data, pos)
+        result["vac"] = bool(secure)
+    else:
+        result["vac"] = False
 
     # Bots
     if pos < len(data):
-        result["bots"], pos = safe_u8(data, pos)
+        result["bots"], pos = read_u8(data, pos)
+    else:
+        result["bots"] = 0
 
     return result
 
 
-# ============================================================
-# MODERN A2S INFO
-# ============================================================
-
 def parse_modern_info(data):
 
-    result = {
-        "response_type": "0x49",
-        "address": "",
-        "name": "",
-        "map": "",
-        "folder": "",
-        "game": "",
-        "players": 0,
-        "maxplayers": 0,
-        "bots": 0,
-        "protocol": 0,
-        "type": "",
-        "os": "",
-        "password": False,
-        "vac": False
-    }
-
     if len(data) < 6:
-        return result
+        raise ValueError("Modern info packet too short")
 
     if data[:5] != b"\xff\xff\xff\xff\x49":
-        return result
+        raise ValueError("Not a 0x49 response")
 
     pos = 5
 
-    # Protocol
-    result["protocol"], pos = safe_u8(data, pos)
+    result = {}
+
+    result["protocol"], pos = read_u8(data, pos)
 
     result["name"], pos = read_cstring(data, pos)
     result["map"], pos = read_cstring(data, pos)
     result["folder"], pos = read_cstring(data, pos)
     result["game"], pos = read_cstring(data, pos)
 
-    # App ID
-    _, pos = safe_u16(data, pos)
+    result["appid"], pos = read_u16(data, pos)
 
-    result["players"], pos = safe_u8(data, pos)
-    result["maxplayers"], pos = safe_u8(data, pos)
-    result["bots"], pos = safe_u8(data, pos)
+    result["players"], pos = read_u8(data, pos)
+    result["maxplayers"], pos = read_u8(data, pos)
+    result["bots"], pos = read_u8(data, pos)
 
-    if pos < len(data):
-        result["type"] = chr(data[pos])
-        pos += 1
+    result["type"] = chr(data[pos])
+    pos += 1
 
-    if pos < len(data):
-        result["os"] = chr(data[pos])
-        pos += 1
+    result["os"] = chr(data[pos])
+    pos += 1
 
-    password, pos = safe_u8(data, pos)
+    password, pos = read_u8(data, pos)
     result["password"] = bool(password)
 
-    vac, pos = safe_u8(data, pos)
+    vac, pos = read_u8(data, pos)
     result["vac"] = bool(vac)
+
+    result["version"], pos = read_cstring(data, pos)
 
     return result
 
 
-# ============================================================
-# INFO QUERY
-# ============================================================
-
 def query_info(sock, target):
 
     # --------------------------------------------------------
-    # Modern A2S_INFO
+    # First: modern A2S_INFO
     # --------------------------------------------------------
 
-    request_packet = (
+    packet = (
         b"\xff\xff\xff\xff"
         b"\x54"
         b"Source Engine Query\x00"
     )
 
-    data, ping, addr = send_recv(sock, target, request_packet)
+    try:
 
-    if data:
+        data, ping = send_packet(
+            sock,
+            target,
+            packet
+        )
 
-        full = receive_response(sock, data, target)
+        data = receive_complete(
+            sock,
+            data
+        )
 
-        if full and full[:5] == b"\xff\xff\xff\xff\x49":
-            info = parse_modern_info(full)
+        if data[:5] == b"\xff\xff\xff\xff\x49":
+
+            info = parse_modern_info(data)
+
+            info["response_type"] = "0x49"
             info["ping"] = ping
-            info["bytes"] = len(full)
-            info["raw"] = full.hex(" ")
+            info["bytes"] = len(data)
+            info["raw"] = data.hex(" ")
+
             return info
+
+    except Exception:
+        pass
 
     # --------------------------------------------------------
     # Legacy GoldSrc details
     # --------------------------------------------------------
 
-    legacy_packet = (
+    packet = (
         b"\xff\xff\xff\xff"
         b"details\x00"
     )
 
-    data, ping, addr = send_recv(sock, target, legacy_packet)
+    data, ping = send_packet(
+        sock,
+        target,
+        packet
+    )
 
-    if data:
+    data = receive_complete(
+        sock,
+        data
+    )
 
-        full = receive_response(sock, data, target)
+    if data[:5] != b"\xff\xff\xff\xff\x6d":
+        raise ValueError(
+            "Server did not return GoldSrc details"
+        )
 
-        if full and full[:5] == b"\xff\xff\xff\xff\x6d":
-            info = parse_legacy_info(full)
-            info["ping"] = ping
-            info["bytes"] = len(full)
-            info["raw"] = full.hex(" ")
-            return info
+    info = parse_legacy_info(data)
 
-    return None
+    info["response_type"] = "0x6D"
+    info["ping"] = ping
+    info["bytes"] = len(data)
+    info["raw"] = data.hex(" ")
+
+    return info
 
 
 # ============================================================
-# LEGACY GOLD-SRC PLAYERS
+# PLAYER RESPONSE
 # ============================================================
 
-def parse_legacy_players(data):
-
-    players = []
+def parse_players(data):
 
     if len(data) < 6:
-        return players
+        raise ValueError("Player response too short")
 
     if data[:5] != b"\xff\xff\xff\xff\x44":
-        return players
+        raise ValueError(
+            "Unexpected player response: " +
+            data[:16].hex(" ")
+        )
 
     pos = 5
 
-    count, pos = safe_u8(data, pos)
+    count, pos = read_u8(data, pos)
+
+    players = []
 
     for _ in range(count):
 
-        if pos >= len(data):
-            break
+        index, pos = read_u8(data, pos)
 
-        index, pos = safe_u8(data, pos)
+        name, pos = read_cstring(
+            data,
+            pos
+        )
 
-        name, pos = read_cstring(data, pos)
+        score, pos = read_i32(
+            data,
+            pos
+        )
 
-        score, pos = safe_i32(data, pos)
-
-        duration, pos = safe_float(data, pos)
+        duration, pos = read_float(
+            data,
+            pos
+        )
 
         players.append({
             "index": index,
@@ -422,68 +414,97 @@ def parse_legacy_players(data):
     return players
 
 
-def query_legacy_players(sock, target):
+# ============================================================
+# RULE RESPONSE
+# ============================================================
 
-    packet = (
-        b"\xff\xff\xff\xff"
-        b"players\x00"
+def parse_rules(data):
+
+    if len(data) < 7:
+        raise ValueError("Rules response too short")
+
+    if data[:5] != b"\xff\xff\xff\xff\x45":
+        raise ValueError(
+            "Unexpected rules response: " +
+            data[:16].hex(" ")
+        )
+
+    pos = 5
+
+    count, pos = read_u16(
+        data,
+        pos
     )
 
-    data, ping, addr = send_recv(sock, target, packet)
+    rules = {}
 
-    if not data:
-        return [], None, None, "No response"
+    for _ in range(count):
 
-    full = receive_response(sock, data, target)
+        key, pos = read_cstring(
+            data,
+            pos
+        )
 
-    if not full:
-        return [], ping, None, "Empty response"
+        value, pos = read_cstring(
+            data,
+            pos
+        )
 
-    if full[:5] != b"\xff\xff\xff\xff\x44":
-        return [], ping, full, "Unexpected legacy players response"
+        rules[key] = value
 
-    players = parse_legacy_players(full)
-
-    return players, ping, full, None
+    return rules
 
 
 # ============================================================
-# MODERN A2S PLAYER
+# CHALLENGE
 # ============================================================
 
 def get_challenge(sock, target):
 
+    # A2S challenge
     packet = (
         b"\xff\xff\xff\xff"
         b"\x57"
     )
 
-    data, ping, addr = send_recv(sock, target, packet)
+    try:
 
-    if not data:
-        return None
+        data, ping = send_packet(
+            sock,
+            target,
+            packet
+        )
 
-    full = receive_response(sock, data, target)
+        data = receive_complete(
+            sock,
+            data
+        )
 
-    if not full:
-        return None
+        if (
+            data[:5] ==
+            b"\xff\xff\xff\xff\x41"
+            and len(data) >= 9
+        ):
+            return data[5:9]
 
-    # A2S challenge response:
-    #
-    # FF FF FF FF 41 [4-byte challenge]
-
-    if full[:5] == b"\xff\xff\xff\xff\x41" and len(full) >= 9:
-        return full[5:9]
+    except Exception:
+        pass
 
     return None
 
 
+# ============================================================
+# MODERN PLAYER QUERY
+# ============================================================
+
 def query_modern_players(sock, target):
 
-    challenge = get_challenge(sock, target)
+    challenge = get_challenge(
+        sock,
+        target
+    )
 
     if challenge is None:
-        # Some servers accept -1 directly
         challenge = b"\xff\xff\xff\xff"
 
     packet = (
@@ -492,20 +513,25 @@ def query_modern_players(sock, target):
         + challenge
     )
 
-    data, ping, addr = send_recv(sock, target, packet)
+    data, ping = send_packet(
+        sock,
+        target,
+        packet
+    )
 
-    if not data:
-        return [], None, None, "No A2S_PLAYER response"
+    data = receive_complete(
+        sock,
+        data
+    )
 
-    full = receive_response(sock, data, target)
+    # Server gave us a challenge instead
+    if (
+        data[:5] ==
+        b"\xff\xff\xff\xff\x41"
+        and len(data) >= 9
+    ):
 
-    if not full:
-        return [], ping, None, "Empty response"
-
-    # If server returned another challenge
-    if full[:5] == b"\xff\xff\xff\xff\x41" and len(full) >= 9:
-
-        challenge = full[5:9]
+        challenge = data[5:9]
 
         packet = (
             b"\xff\xff\xff\xff"
@@ -513,85 +539,30 @@ def query_modern_players(sock, target):
             + challenge
         )
 
-        data, ping, addr = send_recv(sock, target, packet)
+        data, ping = send_packet(
+            sock,
+            target,
+            packet
+        )
 
-        if not data:
-            return [], ping, None, "No response after challenge"
+        data = receive_complete(
+            sock,
+            data
+        )
 
-        full = receive_response(sock, data, target)
-
-    if full[:5] != b"\xff\xff\xff\xff\x44":
-        return [], ping, full, "Unexpected A2S_PLAYER response"
-
-    players = parse_legacy_players(full)
-
-    return players, ping, full, None
-
-
-# ============================================================
-# LEGACY RULES
-# ============================================================
-
-def parse_rules(data):
-
-    rules = []
-
-    if len(data) < 7:
-        return rules
-
-    if data[:5] != b"\xff\xff\xff\xff\x45":
-        return rules
-
-    pos = 5
-
-    count, pos = safe_u16(data, pos)
-
-    for _ in range(count):
-
-        key, pos = read_cstring(data, pos)
-
-        value, pos = read_cstring(data, pos)
-
-        rules.append({
-            "key": key,
-            "value": value
-        })
-
-    return rules
-
-
-def query_legacy_rules(sock, target):
-
-    packet = (
-        b"\xff\xff\xff\xff"
-        b"rules\x00"
-    )
-
-    data, ping, addr = send_recv(sock, target, packet)
-
-    if not data:
-        return [], None, None, "No response"
-
-    full = receive_response(sock, data, target)
-
-    if not full:
-        return [], ping, None, "Empty response"
-
-    if full[:5] != b"\xff\xff\xff\xff\x45":
-        return [], ping, full, "Unexpected legacy rules response"
-
-    rules = parse_rules(full)
-
-    return rules, ping, full, None
+    return parse_players(data), data
 
 
 # ============================================================
-# MODERN A2S RULES
+# MODERN RULES QUERY
 # ============================================================
 
 def query_modern_rules(sock, target):
 
-    challenge = get_challenge(sock, target)
+    challenge = get_challenge(
+        sock,
+        target
+    )
 
     if challenge is None:
         challenge = b"\xff\xff\xff\xff"
@@ -602,20 +573,25 @@ def query_modern_rules(sock, target):
         + challenge
     )
 
-    data, ping, addr = send_recv(sock, target, packet)
+    data, ping = send_packet(
+        sock,
+        target,
+        packet
+    )
 
-    if not data:
-        return [], None, None, "No A2S_RULES response"
-
-    full = receive_response(sock, data, target)
-
-    if not full:
-        return [], ping, None, "Empty response"
+    data = receive_complete(
+        sock,
+        data
+    )
 
     # Challenge response
-    if full[:5] == b"\xff\xff\xff\xff\x41" and len(full) >= 9:
+    if (
+        data[:5] ==
+        b"\xff\xff\xff\xff\x41"
+        and len(data) >= 9
+    ):
 
-        challenge = full[5:9]
+        challenge = data[5:9]
 
         packet = (
             b"\xff\xff\xff\xff"
@@ -623,23 +599,72 @@ def query_modern_rules(sock, target):
             + challenge
         )
 
-        data, ping, addr = send_recv(sock, target, packet)
+        data, ping = send_packet(
+            sock,
+            target,
+            packet
+        )
 
-        if not data:
-            return [], ping, None, "No response after challenge"
+        data = receive_complete(
+            sock,
+            data
+        )
 
-        full = receive_response(sock, data, target)
-
-    if full[:5] != b"\xff\xff\xff\xff\x45":
-        return [], ping, full, "Unexpected A2S_RULES response"
-
-    rules = parse_rules(full)
-
-    return rules, ping, full, None
+    return parse_rules(data), data
 
 
 # ============================================================
-# FORMAT PLAY TIME
+# LEGACY PLAYERS
+# ============================================================
+
+def query_legacy_players(sock, target):
+
+    packet = (
+        b"\xff\xff\xff\xff"
+        b"players\x00"
+    )
+
+    data, ping = send_packet(
+        sock,
+        target,
+        packet
+    )
+
+    data = receive_complete(
+        sock,
+        data
+    )
+
+    return parse_players(data), data
+
+
+# ============================================================
+# LEGACY RULES
+# ============================================================
+
+def query_legacy_rules(sock, target):
+
+    packet = (
+        b"\xff\xff\xff\xff"
+        b"rules\x00"
+    )
+
+    data, ping = send_packet(
+        sock,
+        target,
+        packet
+    )
+
+    data = receive_complete(
+        sock,
+        data
+    )
+
+    return parse_rules(data), data
+
+
+# ============================================================
+# DURATION
 # ============================================================
 
 def format_duration(seconds):
@@ -649,131 +674,270 @@ def format_duration(seconds):
     except Exception:
         return "0s"
 
-    if seconds < 0:
-        seconds = 0
+    seconds = max(0, int(seconds))
 
-    total = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
 
-    hours = total // 3600
-    minutes = (total % 3600) // 60
-    secs = total % 60
-
-    if hours > 0:
+    if hours:
         return f"{hours}h {minutes}m {secs}s"
 
-    if minutes > 0:
+    if minutes:
         return f"{minutes}m {secs}s"
 
     return f"{secs}s"
 
 
 # ============================================================
-# REVERSE DNS
+# COMPLETE QUERY
 # ============================================================
 
-def reverse_dns(ip):
+def query_server(ip, port):
+
+    target = (
+        ip,
+        int(port)
+    )
+
+    result = {
+        "online": False,
+        "info": None,
+
+        "players": [],
+        "rules": {},
+
+        "players_error": "",
+        "rules_error": "",
+
+        "players_raw": "",
+        "rules_raw": ""
+    }
+
+    # --------------------------------------------------------
+    # INFO
+    # --------------------------------------------------------
+
+    info_sock = make_socket()
 
     try:
-        host = socket.gethostbyaddr(ip)[0]
 
-        if host == ip:
-            return ""
+        info = query_info(
+            info_sock,
+            target
+        )
 
-        return host
+        result["online"] = True
+        result["info"] = info
 
-    except Exception:
-        return ""
+    except Exception as e:
+
+        result["info_error"] = str(e)
+
+        info_sock.close()
+
+        return result
+
+    info_sock.close()
+
+    # --------------------------------------------------------
+    # PLAYER QUERY
+    #
+    # Use separate socket.
+    # This is important because challenge state belongs
+    # to the query conversation.
+    # --------------------------------------------------------
+
+    player_sock = make_socket()
+
+    try:
+
+        if info["response_type"] == "0x6D":
+
+            try:
+
+                players, raw = query_modern_players(
+                    player_sock,
+                    target
+                )
+
+            except Exception:
+
+                # Fallback to original GoldSrc query
+                players, raw = query_legacy_players(
+                    player_sock,
+                    target
+                )
+
+        else:
+
+            players, raw = query_modern_players(
+                player_sock,
+                target
+            )
+
+        result["players"] = players
+
+        result["players_raw"] = raw.hex(" ")
+
+        for p in result["players"]:
+            p["playtime"] = format_duration(
+                p["duration"]
+            )
+
+    except Exception as e:
+
+        result["players_error"] = str(e)
+
+    player_sock.close()
+
+    # --------------------------------------------------------
+    # RULES
+    # --------------------------------------------------------
+
+    rules_sock = make_socket()
+
+    try:
+
+        if info["response_type"] == "0x6D":
+
+            try:
+
+                rules, raw = query_modern_rules(
+                    rules_sock,
+                    target
+                )
+
+            except Exception:
+
+                # Fallback to old GoldSrc query
+                rules, raw = query_legacy_rules(
+                    rules_sock,
+                    target
+                )
+
+        else:
+
+            rules, raw = query_modern_rules(
+                rules_sock,
+                target
+            )
+
+        result["rules"] = rules
+
+        result["rules_raw"] = raw.hex(" ")
+
+    except Exception as e:
+
+        result["rules_error"] = str(e)
+
+    rules_sock.close()
+
+    return result
 
 
 # ============================================================
 # HTML
 # ============================================================
 
-HTML = r"""
+HTML = """
 <!DOCTYPE html>
+
 <html>
+
 <head>
 
 <meta charset="UTF-8">
 
-<title>GoldSrc / WON Server Query</title>
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>GoldSrc Server Query</title>
 
 <style>
 
 body {
-    font-family: Arial, sans-serif;
-    background: #111;
-    color: #eee;
-    margin: 0;
-    padding: 25px;
+    background:#111;
+    color:#eee;
+    font-family:Arial,sans-serif;
+    margin:0;
+    padding:20px;
 }
 
 .container {
-    max-width: 1100px;
-    margin: auto;
-}
-
-h1 {
-    margin-bottom: 5px;
+    max-width:1100px;
+    margin:auto;
 }
 
 .card {
-    background: #1d1d1d;
-    border: 1px solid #333;
-    border-radius: 8px;
-    padding: 18px;
-    margin-top: 18px;
+    background:#1c1c1c;
+    border:1px solid #333;
+    border-radius:8px;
+    padding:18px;
+    margin-top:18px;
 }
 
 input {
-    background: #111;
-    color: white;
-    border: 1px solid #555;
-    padding: 10px;
-    border-radius: 5px;
+    background:#111;
+    color:white;
+    border:1px solid #555;
+    padding:10px;
+    border-radius:5px;
 }
 
 button {
-    padding: 10px 18px;
-    border: 0;
-    border-radius: 5px;
-    cursor: pointer;
+    padding:10px 18px;
+    border:0;
+    border-radius:5px;
+    cursor:pointer;
 }
 
 table {
-    width: 100%;
-    border-collapse: collapse;
+    width:100%;
+    border-collapse:collapse;
 }
 
-th, td {
-    text-align: left;
-    padding: 8px;
-    border-bottom: 1px solid #333;
+th,td {
+    padding:8px;
+    border-bottom:1px solid #333;
+    text-align:left;
 }
 
 th {
-    background: #252525;
+    background:#252525;
 }
 
-.good {
-    color: #6cff6c;
+.online {
+    color:#55ff55;
 }
 
-.bad {
-    color: #ff6666;
+.error {
+    color:#ff6666;
+}
+
+.warning {
+    color:#ffcc55;
+}
+
+.mono {
+    font-family:monospace;
+}
+
+.rule-key {
+    font-family:monospace;
+    width:45%;
+}
+
+.rule-value {
+    font-family:monospace;
+    word-break:break-word;
 }
 
 .raw {
-    white-space: pre-wrap;
-    word-break: break-all;
-    font-family: monospace;
-    font-size: 12px;
-    color: #aaa;
-}
-
-.small {
-    color: #aaa;
-    font-size: 13px;
+    font-family:monospace;
+    font-size:12px;
+    color:#aaa;
+    word-break:break-all;
 }
 
 </style>
@@ -784,140 +948,114 @@ th {
 
 <div class="container">
 
-<h1>GoldSrc / WON Server Query</h1>
+<h1>GoldSrc Server Query</h1>
 
-<form method="get">
+<form>
 
 <input
-    name="ip"
-    value="{{ target_ip }}"
-    placeholder="IP / hostname"
-    required
+name="ip"
+value="{{ ip }}"
+placeholder="IP / hostname"
+required
 >
 
 <input
-    name="port"
-    value="{{ target_port }}"
-    placeholder="Port"
-    size="6"
-    required
+name="port"
+value="{{ port }}"
+size="6"
+placeholder="Port"
+required
 >
 
-<button type="submit">
+<button>
 Query
 </button>
 
 </form>
 
 
-{% if error %}
+{% if queried %}
+
+{% if server.online %}
 
 <div class="card">
 
-<h2 class="bad">Offline / Error</h2>
-
-<p>{{ error }}</p>
-
-</div>
-
-{% endif %}
-
-
-{% if info %}
-
-<div class="card">
-
-<h2 class="good">
-Server Online
+<h2 class="online">
+● Online
 </h2>
 
 <table>
 
 <tr>
-<th>Target</th>
-<td>{{ target_ip }}:{{ target_port }}</td>
-</tr>
-
-<tr>
-<th>Hostname</th>
-<td>{{ hostname }}</td>
-</tr>
-
-<tr>
-<th>Ping</th>
-<td>{{ "%.2f"|format(info.ping) }} ms</td>
-</tr>
-
-<tr>
-<th>Bytes</th>
-<td>{{ info.bytes }}</td>
-</tr>
-
-<tr>
-<th>Response</th>
-<td>{{ info.response_type }}</td>
-</tr>
-
-<tr>
 <th>Server Name</th>
-<td>{{ info.name }}</td>
+<td>{{ server.info.name }}</td>
+</tr>
+
+<tr>
+<th>Game</th>
+<td>{{ server.info.game }}</td>
+</tr>
+
+<tr>
+<th>State</th>
+<td class="online">Online</td>
+</tr>
+
+<tr>
+<th>Address</th>
+<td class="mono">{{ server.info.address }}</td>
 </tr>
 
 <tr>
 <th>Map</th>
-<td>{{ info.map }}</td>
-</tr>
-
-<tr>
-<th>Game / Mod</th>
-<td>{{ info.game }}</td>
+<td>{{ server.info.map }}</td>
 </tr>
 
 <tr>
 <th>Folder</th>
-<td>{{ info.folder }}</td>
+<td>{{ server.info.folder }}</td>
 </tr>
 
 <tr>
 <th>Protocol</th>
-<td>{{ info.protocol }}</td>
+<td>{{ server.info.protocol }}</td>
 </tr>
 
 <tr>
 <th>Players</th>
 <td>
-{{ info.players }}/{{ info.maxplayers }}
+{{ server.info.players }}/{{ server.info.maxplayers }}
 </td>
 </tr>
 
 <tr>
 <th>Bots</th>
-<td>{{ info.bots }}</td>
+<td>{{ server.info.bots }}</td>
 </tr>
 
 <tr>
 <th>Server Type</th>
-<td>{{ info.type }}</td>
+<td>{{ server.info.type }}</td>
 </tr>
 
 <tr>
 <th>OS</th>
-<td>{{ info.os }}</td>
+<td>{{ server.info.os }}</td>
 </tr>
 
 <tr>
 <th>Password</th>
-<td>{{ info.password }}</td>
+<td>{{ server.info.password }}</td>
 </tr>
 
 <tr>
 <th>VAC / Secure</th>
-<td>{{ info.vac }}</td>
+<td>{{ server.info.vac }}</td>
 </tr>
 
 <tr>
-<th>Modded</th>
-<td>{{ info.mod }}</td>
+<th>Query Ping</th>
+<td>{{ "%.2f"|format(server.info.ping) }} ms</td>
 </tr>
 
 </table>
@@ -925,15 +1063,13 @@ Server Online
 </div>
 
 
-<!-- PLAYERS -->
-
 <div class="card">
 
 <h2>
-Players ({{ players|length }})
+PLAYERS
 </h2>
 
-{% if players %}
+{% if server.players %}
 
 <table>
 
@@ -941,10 +1077,10 @@ Players ({{ players|length }})
 <th>#</th>
 <th>Name</th>
 <th>Score</th>
-<th>Play Time</th>
+<th>Time</th>
 </tr>
 
-{% for p in players %}
+{% for p in server.players %}
 
 <tr>
 
@@ -964,39 +1100,47 @@ Players ({{ players|length }})
 
 {% else %}
 
-<p class="bad">
-{{ players_error }}
+<p class="warning">
+No player records returned.
 </p>
+
+{% if server.players_error %}
+<p class="error">
+{{ server.players_error }}
+</p>
+{% endif %}
 
 {% endif %}
 
 </div>
 
 
-<!-- RULES -->
-
 <div class="card">
 
 <h2>
-Server Rules ({{ rules|length }})
+SERVER VARIABLES
 </h2>
 
-{% if rules %}
+{% if server.rules %}
 
 <table>
 
 <tr>
-<th>Rule</th>
+<th>Variable</th>
 <th>Value</th>
 </tr>
 
-{% for r in rules %}
+{% for key,value in server.rules.items() %}
 
 <tr>
 
-<td>{{ r.key }}</td>
+<td class="rule-key">
+{{ key }}
+</td>
 
-<td>{{ r.value }}</td>
+<td class="rule-value">
+{{ value }}
+</td>
 
 </tr>
 
@@ -1004,272 +1148,166 @@ Server Rules ({{ rules|length }})
 
 </table>
 
-{% else %}
-
-<p class="bad">
-{{ rules_error }}
+<p>
+{{ server.rules|length }} variables
 </p>
 
+{% else %}
+
+<p class="warning">
+No server variables returned.
+</p>
+
+{% if server.rules_error %}
+<p class="error">
+{{ server.rules_error }}
+</p>
+{% endif %}
+
 {% endif %}
 
 </div>
 
 
-<!-- RAW INFO -->
+<div class="card">
+
+<h2>
+Raw Info
+</h2>
+
+<div class="raw">
+{{ server.info.raw }}
+</div>
+
+</div>
+
+
+{% if server.players_raw %}
 
 <div class="card">
 
 <h2>
-Raw Info Packet
+Raw Players
 </h2>
 
 <div class="raw">
-{{ info.raw }}
-</div>
-
-</div>
-
-
-{% if players_raw %}
-
-<div class="card">
-
-<h2>
-Raw Players Packet
-</h2>
-
-<div class="raw">
-{{ players_raw }}
-</div>
-
-</div>
-
-{% endif %}
-
-
-{% if rules_raw %}
-
-<div class="card">
-
-<h2>
-Raw Rules Packet
-</h2>
-
-<div class="raw">
-{{ rules_raw }}
+{{ server.players_raw }}
 </div>
 
 </div>
 
 {% endif %}
 
+
+{% if server.rules_raw %}
+
+<div class="card">
+
+<h2>
+Raw Rules
+</h2>
+
+<div class="raw">
+{{ server.rules_raw }}
+</div>
+
+</div>
+
+{% endif %}
+
+
+{% else %}
+
+<div class="card">
+
+<h2 class="error">
+● Offline
+</h2>
+
+<p>
+{{ server.info_error }}
+</p>
+
+</div>
+
+{% endif %}
 
 {% endif %}
 
 </div>
 
 </body>
+
 </html>
 """
 
 
 # ============================================================
-# MAIN QUERY
+# FLASK
 # ============================================================
 
 @app.route("/")
 def index():
 
-    target_ip = request.args.get("ip", "")
-    target_port = request.args.get("port", "27015")
+    ip = request.args.get(
+        "ip",
+        ""
+    ).strip()
 
-    info = None
-    hostname = ""
-    error = None
+    port = request.args.get(
+        "port",
+        "27015"
+    ).strip()
 
-    players = []
-    rules = []
+    queried = bool(ip)
 
-    players_error = "Not queried"
-    rules_error = "Not queried"
+    server = {
+        "online": False,
+        "info_error": ""
+    }
 
-    players_raw = None
-    rules_raw = None
-
-    if target_ip:
+    if queried:
 
         try:
-            port = int(target_port)
 
-            if port < 1 or port > 65535:
-                raise ValueError("Invalid port")
+            int_port = int(port)
 
-        except Exception:
-            return render_template_string(
-                HTML,
-                target_ip=target_ip,
-                target_port=target_port,
-                info=None,
-                hostname="",
-                error="Invalid port",
-                players=[],
-                rules=[],
-                players_error="Not queried",
-                rules_error="Not queried",
-                players_raw=None,
-                rules_raw=None
+            if not 1 <= int_port <= 65535:
+                raise ValueError(
+                    "Invalid port"
+                )
+
+            server = query_server(
+                ip,
+                int_port
             )
-
-        try:
-
-            target = (target_ip, port)
-
-            # Resolve hostname
-            try:
-                socket.inet_aton(target_ip)
-                hostname = reverse_dns(target_ip)
-            except Exception:
-                hostname = ""
-
-            sock = make_socket()
-
-            # ------------------------------------------------
-            # INFO
-            # ------------------------------------------------
-
-            info = query_info(sock, target)
-
-            if not info:
-
-                sock.close()
-
-                return render_template_string(
-                    HTML,
-                    target_ip=target_ip,
-                    target_port=target_port,
-                    info=None,
-                    hostname=hostname,
-                    error="No response from server",
-                    players=[],
-                    rules=[],
-                    players_error="Not queried",
-                    rules_error="Not queried",
-                    players_raw=None,
-                    rules_raw=None
-                )
-
-            # ------------------------------------------------
-            # IMPORTANT:
-            #
-            # 0x6D = old GoldSrc/WON style
-            # 0x49 = modern A2S
-            # ------------------------------------------------
-
-            if info["response_type"] == "0x6D":
-
-                # Legacy GoldSrc
-                players, _, raw, err = query_legacy_players(
-                    sock,
-                    target
-                )
-
-                players_raw = raw.hex(" ") if raw else None
-
-                if err:
-                    players_error = err
-                else:
-                    players_error = "No players"
-
-                rules, _, raw, err = query_legacy_rules(
-                    sock,
-                    target
-                )
-
-                rules_raw = raw.hex(" ") if raw else None
-
-                if err:
-                    rules_error = err
-                else:
-                    rules_error = "No rules"
-
-            else:
-
-                # Modern A2S
-                players, _, raw, err = query_modern_players(
-                    sock,
-                    target
-                )
-
-                players_raw = raw.hex(" ") if raw else None
-
-                if err:
-                    players_error = err
-                else:
-                    players_error = "No players"
-
-                rules, _, raw, err = query_modern_rules(
-                    sock,
-                    target
-                )
-
-                rules_raw = raw.hex(" ") if raw else None
-
-                if err:
-                    rules_error = err
-                else:
-                    rules_error = "No rules"
-
-            sock.close()
-
-            # Format duration
-            for p in players:
-                p["playtime"] = format_duration(
-                    p["duration"]
-                )
 
         except Exception as e:
 
-            error = str(e)
+            server = {
+                "online": False,
+                "info_error": str(e)
+            }
 
     return render_template_string(
         HTML,
-
-        target_ip=target_ip,
-        target_port=target_port,
-
-        info=info,
-        hostname=hostname,
-
-        error=error,
-
-        players=players,
-        rules=rules,
-
-        players_error=players_error,
-        rules_error=rules_error,
-
-        players_raw=players_raw,
-        rules_raw=rules_raw
+        ip=ip,
+        port=port,
+        queried=queried,
+        server=server
     )
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
 @app.route("/health")
 def health():
-
     return "OK"
 
 
 # ============================================================
-# LOCAL RUN
+# START
 # ============================================================
 
 if __name__ == "__main__":
-
-    import os
 
     port = int(
         os.environ.get(
